@@ -29,13 +29,14 @@ On the `llm/stream` hook, it finds the **last** instruction-injection message an
 replaces its body with a line-level diff against the previously loaded version.
 
 ```
-C:\...\default-workspace\AGENTS.md changed (now 312 lines). Below is the diff
+C:\...\my-project\AGENTS.md changed (now 312 lines). Below is the diff
 against what you already have, not the full file.
 
 ````text
-  **复核时刻**：2026-12-11（一个月后重读那份 config.json，别信这里抄的数）
--
-- <!-- test: ... -->
+  ## Build and test
+- Run `npm test` before you commit.
++ Run `npm run check` before you commit.
+  ## Style
 ````
 
 `-` removed, `+` added, unprefixed lines are context anchors. Everything else is unchanged.
