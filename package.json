@@ -1,0 +1,50 @@
+{
+  "name": "dsh-context-diff",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Inject only the diff when AGENTS.md changes, instead of re-sending the whole file every time. No file IO, no history rewrite, fail-open.",
+  "license": "MIT",
+  "author": "Heureka",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "context",
+    "diff",
+    "agents-md",
+    "tokens",
+    "prompt-cache"
+  ],
+  "homepage": "https://github.com/Heureka/dsh-context-diff#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Heureka/dsh-context-diff.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Heureka/dsh-context-diff/issues"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
