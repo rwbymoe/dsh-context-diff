@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-diff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Inject only the diff when AGENTS.md changes, instead of re-sending the whole file every time. No file IO, no history rewrite, fail-open.",
   "license": "MIT",
