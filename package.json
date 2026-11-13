@@ -1,10 +1,10 @@
 {
   "name": "dsh-context-diff",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Inject only the diff when AGENTS.md changes, instead of re-sending the whole file every time. No file IO, no history rewrite, fail-open.",
   "license": "MIT",
-  "author": "Heureka",
+  "author": "rwbymoe",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -15,13 +15,13 @@
     "tokens",
     "prompt-cache"
   ],
-  "homepage": "https://github.com/Heureka/dsh-context-diff#readme",
+  "homepage": "https://github.com/rwbymoe/dsh-context-diff#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Heureka/dsh-context-diff.git"
+    "url": "git+https://github.com/rwbymoe/dsh-context-diff.git"
   },
   "bugs": {
-    "url": "https://github.com/Heureka/dsh-context-diff/issues"
+    "url": "https://github.com/rwbymoe/dsh-context-diff/issues"
   },
   "main": "./index.js",
   "exports": {
