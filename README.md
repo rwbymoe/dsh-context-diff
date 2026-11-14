@@ -2,7 +2,7 @@
 
 > Only the diff, not the whole file.
 
-A [DSH](https://github.com/deepseek-ai/dsh) plugin that rewrites repeated
+A [DSH](https://github.com/deepseek-ai/deepseek-harness) plugin that rewrites repeated
 `AGENTS.md` / `CLAUDE.md` injections so that only the **changed lines** are sent,
 not the entire file each time.
 
@@ -12,16 +12,20 @@ DSH's built-in `dsh-agent-instructions` re-renders the **full content** of an
 instruction file every time it changes, wrapped in a note saying "use this
 instead of what you loaded before". Earlier copies stay in the context.
 
-Measured on one real session (before this plugin):
+Measured on one real session, at one moment — what a **single context surface**
+held, not the session's whole history:
 
 | | |
 |---|---|
-| Instruction injections retained in context | 37 |
-| Total size | ~955 KB |
-| **Obsolete copies superseded by a later version** | **36** |
-| Obsolete bytes still occupying context | **~932 KB** |
+| Instruction copies present in that context | 37 |
+| Their total size | ~988 KB (32.5% of the context) |
+| **Superseded by a later version** | **36** |
+| Superseded bytes still occupying context | **~932 KB** |
 
-Roughly a third of that session's context was stale copies of the same file.
+So about a third of that context was stale copies of one file. The 37 is the
+number of copies that were still resident at that moment; across a long session
+the running total of injections is much larger (this very project's session has
+had 463), because a compaction clears the surface and the count starts again.
 
 ## What it does
 
@@ -113,9 +117,12 @@ positions, and says so in the output.
 
 - **Line granularity.** Changing a few characters inside one line produces one
   `-` line and one `+` line, not a character-level diff.
-- **Per-file baseline.** State is keyed by file path, not session, so two sessions
-  editing the same file share a baseline. Worst case: a larger diff, never a
-  wrong one.
+- **Per-file baseline.** State is keyed by the file path, not the session, so two
+  sessions using the same file share one baseline. If session A advances it, the
+  next injection in session B compares equal and is passed through unchanged —
+  B receives the host's **full text**, so nothing is lost, but that one request
+  gets no saving. The entry count stays bounded by the number of instruction
+  files.
 - **Approximation for huge differences.** See above.
 
 ## License

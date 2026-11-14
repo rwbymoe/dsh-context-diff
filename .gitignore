@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Local notes — never published, never committed.
+# Discussion logs, decision records and reproduction scripts live here.
+.local/
+
+# Local backups of the source
+index.js.bak*
+*.bak
+
+# Release helper — hard-codes this machine's paths, so it stays local.
+release.mjs
+
+# Temp files from release.mjs
+.git-commit-msg
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.log

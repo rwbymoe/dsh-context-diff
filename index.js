@@ -1,86 +1,103 @@
 /**
- * dsh-context-diff —— 让 AGENTS.md 的变更只注入差异，而不是整份重贴。
+ * dsh-context-diff — send only the diff when an instruction file changes,
+ * instead of re-sending the whole file every time.
  *
- * ## 问题
+ * ## The problem
  *
- * DSH 的 `dsh-agent-instructions` 在指令文件变化时，每次都把**整份内容**重贴进
- * 上下文，同时加一句「用这份替换之前加载的」。实测代价：一次压缩之后累积 37 次
- * 注入、约 955 KB，其中 36 份已被后续版本作废，但仍占着上下文。
+ * DSH's `dsh-agent-instructions` re-renders the **full content** of an
+ * instruction file each time it changes, wrapped in a note saying "use this
+ * instead of what you loaded before". Measured on one real session: 37
+ * injections after a compaction, about 955 KB, of which 36 were already
+ * superseded by a later version but still occupied the context.
  *
- * ## 做法
+ * ## What it does
  *
- * 在 `llm/stream` 上，把「还没发过的那一条」注入消息的正文换成行级 diff。
- * **不改宿主，不改会话记录，只改这一次请求的内容。**
+ * On the `llm/stream` hook it replaces the body of the **last** instruction
+ * injection with a line-level diff. **It does not touch the host, does not
+ * touch the session log, and changes only the content of this one request.**
  *
- * ## 三条硬约束
+ * ## Three hard constraints
  *
- * 1. **不改任何历史** —— 只改最后一条 agent-instructions，且同一条只改一次。
- * 2. **首次 / 压缩后是全量** —— 没有 baseline 可比时原样放行；压缩会重建上下文，
- *    此时清空 baseline，下一条重新以全量为基准。
- * 3. **fail-open** —— 任何异常都原样放行，并把错误打到 logger.error 与 console.error。
- *    宁可多花 token，也不让读到的规矩是错的。
+ * 1. **Never touch history.** Only the last `agent-instructions` message is
+ *    rewritten, and each message is rewritten at most once.
+ * 2. **First load and post-compaction are full text.** With no baseline to
+ *    compare against, the message passes through untouched. A compaction
+ *    rebuilds the context, so the baseline is cleared and the next injection
+ *    re-establishes it in full.
+ * 3. **fail-open.** Any error lets the original request through and reports
+ *    to `logger.error` and `console.error`. Spending extra tokens beats
+ *    reading a wrong rule.
  *
- * ## 只读，不写
+ * ## Read only, never write
  *
- * **这个插件不写任何文件。** 它读取指令文件是为了拿到正文做 diff；除此之外
- * 不落盘、不改会话记录、不碰缓存文件、不写诊断日志。
+ * **This plugin writes no file.** It reads nothing from disk either — the
+ * body it needs is already in the message it is given. No state file, no
+ * cache file, no diagnostic log.
  *
- * 诊断走宿主 logger（`ctx.logger`）。要更详细的逐次记录，设环境变量
- * `DSH_CONTEXT_DIFF_DEBUG=1` —— 那时也只走 logger，仍然不写文件。
+ * Diagnostics go to the host logger (`ctx.logger`). For a line per decision,
+ * set `DSH_CONTEXT_DIFF_DEBUG=1` — even then it only logs, it never writes.
  *
- * ## 依赖
+ * ## Dependencies
  *
- * 零运行时依赖。diff 用内置的 Myers 算法（见 `diffLines`）。
+ * No runtime dependencies. The diff is Myers' algorithm, implemented below
+ * (see `diffLines`).
  *
  * @license MIT
  */
 import os from 'node:os'
 import path from 'node:path'
 
-/** 版本戳，便于确认运行的是哪份代码。 */
-export const BUILD = '2026-11-13T04:00+08:00 · context-diff · Myers + 零依赖 + fail-open + read-only'
+/** Build stamp, so it is obvious which copy is running. */
+export const BUILD = '2026-11-14T17:00+08:00 · context-diff · Myers + zero deps + fail-open + read-only'
 
 export const name = 'dsh-context-diff'
 export const inject = []
 
-/** 每处变更前后各带几行作锚点。 */
-const CTX = 3
+/**
+ * Context lines kept before and after each change, as anchors.
+ *
+ * Two is enough: the anchors only say *where* a change sits, and the full file
+ * is always on disk for the model to read when it needs exact wording. Going
+ * from 3 to 2 cuts the rendered diff by 11% for a one-line change and about
+ * 20% once several hunks are involved.
+ */
+const CTX = 2
 
 /**
- * 是否输出逐次诊断。
+ * Whether to emit a line per decision.
  *
- * **默认静默。** 只有设了 `DSH_CONTEXT_DIFF_DEBUG=1` 才往宿主 logger 写每次
- * BASELINE / DIFF / SKIP —— 仍然**不写任何文件**。
+ * **Silent by default.** Only `DSH_CONTEXT_DIFF_DEBUG=1` makes it log each
+ * BASELINE / DIFF / SKIP to the host logger — and even then it writes no file.
  *
- * 判据：常驻路径上不该有磁盘 I/O，也不该每次请求都往日志刷一行。
+ * A hot path should do no disk I/O and should not print a line per request.
  *
  * @returns {boolean}
  */
 const debugOn = () => process.env.DSH_CONTEXT_DIFF_DEBUG === '1'
 
 /**
- * 报错必须显眼：info 级会淹没在宿主日志里。
+ * Errors must stand out: `info` would drown in the host log.
  *
- * ⚠️ 只走 logger，不落盘。
+ * ⚠️ Logger only, never a file.
  *
  * @param {object} ctx
  * @param {string} msg
  */
 const shout = (ctx, msg) => {
-  try { ctx.logger?.error?.(`[context-diff] ${msg}`) } catch { /* 忽略 */ }
-  try { console.error(`[context-diff] ${msg}`) } catch { /* 忽略 */ }
+  try { ctx.logger?.error?.(`[context-diff] ${msg}`) } catch { /* ignore */ }
+  try { console.error(`[context-diff] ${msg}`) } catch { /* ignore */ }
 }
 
 // ═══════════════════════════════════════════════════════════
-// 识别
+// Identification
 // ═══════════════════════════════════════════════════════════
 
 /**
- * 这条消息是不是指令文件注入。
+ * Is this message an instruction-file injection?
  *
- * 判据是 `source.kind === 'agent-instructions'` —— 宿主的
- * `dsh-agent-instructions` 是唯一产出它的组件，且只覆盖 AGENTS.md /
- * CLAUDE.md / *.local.md / 用户级同名文件这一类。
+ * The test is `source.kind === 'agent-instructions'` — the host's
+ * `dsh-agent-instructions` is the only producer, and it covers only AGENTS.md /
+ * CLAUDE.md / *.local.md and the user-global files of the same names.
  *
  * @param {object} message
  * @returns {boolean}
@@ -92,7 +109,7 @@ function isInstructionMessage(message) {
 }
 
 /**
- * 取消息正文。
+ * The message's text.
  * @param {object} message
  * @returns {string}
  */
@@ -107,14 +124,14 @@ function textOf(message) {
 }
 
 /**
- * 从渲染好的注入正文里剥出指令文件原文。
+ * Strip the rendered injection down to the instruction file's own text.
  *
- * 宿主有两种渲染形状：
+ * The host renders two shapes:
  *   updated  —— `Updated instructions from: <path>` +
- *               `This file changed after it was loaded. ...` + 正文
- *   baseline —— `Instructions from: <path>` + 正文
+ *               `This file changed after it was loaded. ...` + body
+ *   baseline — `Instructions from: <path>` + body
  *
- * 都认不出来就返回 null，调用方据此 fail-open。
+ * Anything else returns null, and the caller fails open on that.
  *
  * @param {string} text
  * @returns {string|null}
@@ -136,14 +153,14 @@ function bodyOf(text) {
 }
 
 /**
- * 把 `source.changes[].path` 补成完整路径。
+ * Resolve `source.changes[].path` to an absolute path.
  *
- * scope 前缀决定根目录（实测）：
+ * The scope prefix picks the root directory:
  *   `user-global` → `~/.dsh`
- *   `.`           → 工作区根
+ *   `.`           → the workspace root
  *
  * @param {{path?: string, scope?: string}} change
- * @param {string} cwd 工作区根，由调用方从 ctx 取
+ * @param {string} cwd workspace root, taken from ctx by the caller
  * @returns {string}
  */
 function fullPathOf(change, cwd) {
@@ -166,24 +183,34 @@ function fullPathOf(change, cwd) {
 // ═══════════════════════════════════════════════════════════
 
 /**
- * Myers 差异算法：求两行序列的最短编辑脚本。
+ * Myers' difference algorithm: the shortest edit script between two line arrays.
  *
- * 相比 LCS 的 O(m·n) 矩阵，Myers 的复杂度是 O((m+n)·D)，D 是差异数。
- * 指令文件绝大多数时候只改几行，D 很小，因此内存与时间都远低于矩阵法。
+ * Where an LCS matrix costs O(m·n), Myers costs O((m+n)·D) with D the number of differences.
+ * Instruction files usually change a few lines, so D is small and both time and memory stay low.
  *
- * 实现取自 Myers 1986 论文的贪心版本（只保留当前一轮的 V 数组），
- * 再回溯出完整的编辑操作序列。
+ * This is the greedy version from Myers (1986), keeping only one round of V,
+ * then walking back to recover the full operation sequence.
  *
- * @param {string[]} a 旧行
- * @param {string[]} b 新行
+ * @param {string[]} a old lines
+ * @param {string[]} b new lines
  * @returns {Array<{op:'equal'|'delete'|'insert', line:string}>}
  */
 function myersDiff(a, b) {
   const n = a.length
   const m = b.length
   const max = n + m
-  // 差异超过这个规模就别算精确解了，交给调用方的近似分支
-  const LIMIT = 4000
+  // Past this edit distance give up on the exact answer and let the caller take
+  // its approximate branch.
+  //
+  // D counts the lines that genuinely changed, so D ≈ 2 × (lines changed).
+  // Measured cost on a 400-line file: D=200 took 2.3 ms, D=800 took 8.8 ms, and
+  // a 1000-line file rewritten end to end (D=2000) took 137 ms. This runs before
+  // every request, so the ceiling is about latency, not memory.
+  //
+  // 1000 ≈ a 500-line file changing everywhere. By that point the rendering is
+  // already far larger than the original, so the caller's worth-it guard would
+  // throw it away — paying for an exact answer there buys nothing.
+  const LIMIT = 1000
 
   if (n === 0 && m === 0) return []
   if (n === 0) return b.map((line) => ({ op: 'insert', line }))
@@ -191,7 +218,7 @@ function myersDiff(a, b) {
 
   const offset = max
   const v = new Int32Array(2 * max + 2)
-  /** 每一步的 V 快照，供回溯使用 */
+  /** One snapshot of V per round, kept for the walk back */
   const trace = []
 
   let found = false
@@ -199,14 +226,14 @@ function myersDiff(a, b) {
 
   for (let d = 0; d <= max; d++) {
     if (d > LIMIT) break
-    // 快照：只存会被读取的那一段
+    // Snapshot only the slice the walk back can read
     trace.push(v.slice(offset - d - 1, offset + d + 2))
     for (let k = -d; k <= d; k += 2) {
       let x
       if (k === -d || (k !== d && v[offset + k - 1] < v[offset + k + 1])) {
-        x = v[offset + k + 1]           // 向下（插入）
+        x = v[offset + k + 1]           // down: an insertion
       } else {
-        x = v[offset + k - 1] + 1        // 向右（删除）
+        x = v[offset + k - 1] + 1        // right: a deletion
       }
       let y = x - k
       while (x < n && y < m && a[x] === b[y]) { x++; y++ }
@@ -216,9 +243,9 @@ function myersDiff(a, b) {
     if (found) break
   }
 
-  if (!found) return null   // 差异太大，调用方走近似分支
+  if (!found) return null   // too different; caller takes the approximate branch
 
-  // 回溯
+  // Walk back
   const ops = []
   let x = n
   let y = m
@@ -246,11 +273,11 @@ function myersDiff(a, b) {
 }
 
 /**
- * 行级 diff，输出带上下文锚点的变更段。
+ * A line-level diff, as runs of changes with context anchors.
  *
- * 两条路：
- *   精确 —— Myers 求最小编辑脚本，再按 CTX 切出 hunks
- *   近似 —— 差异过大时只报「删了哪些行 / 加了哪些行」，不保证位置
+ * Two branches:
+ *   exact — Myers gives the minimal script, cut into hunks with CTX lines of context
+ *   approx — when the difference is too large, list removed/added lines without positions
  *
  * @param {string} oldText
  * @param {string} newText
@@ -271,10 +298,10 @@ function diffLines(oldText, newText) {
     return { kind: 'approx', hunks: [{ before: [], removed, added, after: [] }] }
   }
 
-  // 把操作序列按「变更块」切分
+  // Cut the operation sequence into runs of changes
   const hunks = []
   let i = 0
-  let ai = 0   // 当前在旧文本中的行号
+  let ai = 0   // current line number in the old text
   while (i < ops.length) {
     if (ops[i].op === 'equal') { ai++; i++; continue }
 
@@ -292,7 +319,7 @@ function diffLines(oldText, newText) {
       added,
       after: A.slice(startA + removed.length, startA + removed.length + CTX),
     })
-    // 跳过紧跟的 equal 段（收集上下文即可，hunk 本身已带上）
+    // Skip the equal run that follows; the hunk already carries its context
     while (i < ops.length && ops[i].op === 'equal') { ai++; i++ }
   }
 
@@ -300,11 +327,11 @@ function diffLines(oldText, newText) {
 }
 
 /**
- * 把 diff 渲染成给人读的文本。
+ * Render a diff as text meant to be read.
  *
- * @param {string} sourcePath 完整路径
+ * @param {string} sourcePath absolute path
  * @param {{kind:string, hunks:Array}} diff
- * @param {number} newLen 新版行数
+ * @param {number} newLen line count of the new version
  * @returns {string}
  */
 function renderDiff(sourcePath, diff, newLen) {
@@ -333,7 +360,7 @@ function renderDiff(sourcePath, diff, newLen) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 插件
+// The plugin
 // ═══════════════════════════════════════════════════════════
 
 /**
@@ -341,8 +368,12 @@ function renderDiff(sourcePath, diff, newLen) {
  */
 export function apply(ctx) {
   /**
-   * 按文件路径存状态。同一份文件在不同会话里内容相同，
-   * 用路径当 key 保证 diff 比的是同一个文件的前后版本。
+   * Per-file state.
+   *
+   * Keyed by the instruction file's path, so a file that two sessions both
+   * use shares one baseline. The entry count is therefore bounded by the
+   * number of instruction files — it does not grow with sessions.
+   *
    * @type {Map<string, {baseline: string|null, injected: Set<string>, rewritten: number}>}
    */
   const states = new Map()
@@ -356,12 +387,13 @@ export function apply(ctx) {
     return s
   }
 
+  /** State key: the file path itself. The file count is fixed, so `states` is bounded. */
   const keyOf = (msg) => {
     const p = msg?.source?.changes?.[0]?.path
     return typeof p === 'string' && p.length > 0 ? p : '(unknown)'
   }
 
-  /** 尽力取当前工作目录；拿不到就交给 fullPathOf 用 process.cwd() 兜底。 */
+  /** Best-effort working directory; fullPathOf falls back to process.cwd(). */
   const cwdOf = () => {
     try {
       const wd = ctx.get?.('workingDirectory')
@@ -369,7 +401,7 @@ export function apply(ctx) {
     } catch { return '' }
   }
 
-  // ── 压缩后清空 baseline：下一条注入必须以全量为基准 ──
+  // ── A compaction invalidates every baseline: the next injection is full text ──
   ctx.on('session/event', (session, event) => {
     try {
       if (event?.type !== 'compaction/end') return
@@ -389,7 +421,7 @@ export function apply(ctx) {
       const messages = options?.messages
       if (!Array.isArray(messages) || messages.length === 0) return next()
 
-      // 只找最后一条指令注入
+      // Only the last instruction injection is rewritten
       let idx = -1
       for (let i = messages.length - 1; i >= 0; i--) {
         if (isInstructionMessage(messages[i])) { idx = i; break }
@@ -399,7 +431,7 @@ export function apply(ctx) {
       const msg = messages[idx]
       const st = stateOf(keyOf(msg))
 
-      // 同一条消息只改一次
+      // Each message is rewritten at most once
       const msgId = String(msg?.id ?? '')
       if (msgId !== '' && st.injected.has(msgId)) return next()
 
@@ -410,7 +442,7 @@ export function apply(ctx) {
         return next()
       }
 
-      // 首次：全量，记基准
+      // First time: full text, and this becomes the baseline
       if (st.baseline === null) {
         st.baseline = body
         if (msgId !== '') st.injected.add(msgId)
@@ -428,14 +460,14 @@ export function apply(ctx) {
       const newLen = body.split('\n').length
       const rendered = renderDiff(fullPathOf(msg?.source?.changes?.[0], cwdOf()), diff, newLen)
 
-      // ── 收益守卫：diff 不比原文短，就原样放行 ──
+      // ── Worth-it guard: if the diff is no shorter than the original, pass the original ──
       //
-      // 文件大改时（几乎每行都变），每个 hunk 还带 CTX 行上下文，
-      // 渲染出来可能**比全文还长**。实测一份 383 行文件改成 334 行，
-      // 101 个 hunk 渲染出 41,865 字符，而原文才 12,901 —— 反而多花 3 倍 token。
+      // When a file changes almost everywhere, every hunk still carries CTX lines of
+      // context, so the rendering can come out longer than the full text: a 383-line
+      // file changed into 334 lines gave 101 hunks and 41,865 characters against 12,901.
       //
-      // 判据：**按字节比**，不是按字符（中文一字 3 字节）。
-      // 不划算就用原文，同时把 baseline 推到新版（否则下次还在比旧版）。
+      // Compare in bytes, not characters: one CJK character is three bytes in UTF-8.
+      // Send the original and still advance the baseline, or the next call compares the old one.
       const textBytes = Buffer.byteLength(text, 'utf8')
       const renderedBytes = Buffer.byteLength(rendered, 'utf8')
       if (renderedBytes >= textBytes) {
@@ -468,7 +500,7 @@ export function apply(ctx) {
 
       return next({ ...options, messages: nextMessages })
     } catch (e) {
-      // fail-open：原样放行，错误必须可见
+      // fail-open: pass the original through, and make the error visible
       shout(ctx, `rewrite failed, falling back to full text: ${e?.message ?? e}`)
       return next()
     }
@@ -477,5 +509,5 @@ export function apply(ctx) {
   ctx.logger?.info?.(`[context-diff] loaded ${BUILD}`)
 }
 
-// 供测试使用（不影响插件加载）
+// For tests; does not affect plugin loading
 export const __test = { bodyOf, diffLines, myersDiff, renderDiff, fullPathOf, isInstructionMessage }
