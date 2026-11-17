@@ -1,8 +1,8 @@
 {
   "name": "dsh-context-diff",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Inject only the diff when AGENTS.md changes, instead of re-sending the whole file every time. No file IO, no history rewrite, fail-open.",
+  "description": "Inject only the diff when an instruction file changes, instead of re-sending the whole file every time. One baseline per file, line endings normalised, no file IO, fail-open.",
   "license": "MIT",
   "author": "rwbymoe",
   "keywords": [
@@ -33,6 +33,7 @@
     "index.js",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {

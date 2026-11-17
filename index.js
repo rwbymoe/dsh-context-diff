@@ -34,8 +34,12 @@
  * body it needs is already in the message it is given. No state file, no
  * cache file, no diagnostic log.
  *
- * Diagnostics go to the host logger (`ctx.logger`). For a line per decision,
- * set `DSH_CONTEXT_DIFF_DEBUG=1` — even then it only logs, it never writes.
+ * Its state is one in-memory map, dropped on restart. Dropping it is the safe
+ * direction: the next injection arrives as full text and re-establishes it.
+ *
+ * Diagnostics go to stdout via `console.log`, because `ctx.logger` output does
+ * not reach a terminal or a file on every host. For a line per decision, set
+ * `DSH_CONTEXT_DIFF_DEBUG=1` — even then it only prints, it never writes.
  *
  * ## Dependencies
  *
@@ -48,7 +52,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 /** Build stamp, so it is obvious which copy is running. */
-export const BUILD = '2026-11-14T17:00+08:00 · context-diff · Myers + zero deps + fail-open + read-only'
+export const BUILD = '2026-11-18T01:30+08:00 · context-diff · per-file baseline + EOL-normalised + Myers + zero deps + fail-open + read-only'
 
 export const name = 'dsh-context-diff'
 export const inject = []
@@ -124,32 +128,160 @@ function textOf(message) {
 }
 
 /**
+ * Normalise line endings for in-memory comparison.
+ *
+ * **Never write this back to disk.** The only thing that has to match is the two
+ * strings being compared.
+ *
+ * Why it is required: the same instruction file can arrive with CRLF on one turn
+ * and LF on another — an editor that saves as LF is enough, and nothing warns
+ * you. Without this every line differs, because the `\r` is part of the line.
+ * Measured on a real session: seq 42281 of `~/.dsh/AGENTS.md` went CRLF → LF and
+ * the diff reported 315 of 316 lines deleted and 315 added. The worth-it guard
+ * happened to catch it (the rendering was larger than the original), but a
+ * smaller file would have gone out as "this whole file was removed".
+ *
+ * `\r\n` collapses to `\n`, and a lone `\r` does too, so CRLF, LF and old-Mac CR
+ * all compare equal.
+ *
+ * @param {string} s
+ * @returns {string}
+ */
+function normalizeEol(s) {
+  return String(s).replace(/\r\n?/g, '\n')
+}
+
+/**
  * Strip the rendered injection down to the instruction file's own text.
  *
- * The host renders two shapes:
- *   updated  —— `Updated instructions from: <path>` +
- *               `This file changed after it was loaded. ...` + body
- *   baseline — `Instructions from: <path>` + body
+ * The host writes four section headers (`dsh-agent-instructions/lib/index.js`):
+ *   L142 `Instructions from: <path>`              — baseline
+ *   L262 `Additional instructions from: <path>`   — action "set"
+ *   L283 `Instructions removed: <path>`           — action "remove" (no body)
+ *   L285 `Updated instructions from: <path>`      — action "replace"
  *
- * Anything else returns null, and the caller fails open on that.
+ * This function handles the shapes the single-section path needs — `Updated` and
+ * baseline — and returns null for anything else so the caller fails open.
+ * Multi-file splitting happens in `splitSections`, which is the path actually
+ * used by the hook.
  *
  * @param {string} text
  * @returns {string|null}
  */
 function bodyOf(text) {
-  if (typeof text !== 'string' || text.length === 0) return null
+  const src = normalizeEol(text)
+  if (src.length === 0) return null
   const stripTail = (s) => s.replace(/<\/system-reminder>\s*$/, '').trim()
 
-  const afterMarker = text.replace(
+  const afterMarker = src.replace(
     /^[\s\S]*?This file changed after it was loaded\.[^\n]*\n+/,
     '',
   )
-  if (afterMarker !== text) return stripTail(afterMarker)
+  if (afterMarker !== src) return stripTail(afterMarker)
 
-  const afterHeader = text.replace(/^[\s\S]*?Instructions from:[^\n]*\n+/, '')
-  if (afterHeader !== text) return stripTail(afterHeader)
+  const afterHeader = src.replace(/^[\s\S]*?Instructions from:[^\n]*\n+/, '')
+  if (afterHeader !== src) return stripTail(afterHeader)
 
   return null
+}
+
+/**
+ * Section headers written by the host, most specific prefix first so that
+ * `Additional instructions from:` and `Updated instructions from:` cannot be
+ * mistaken for the bare `Instructions from:`.
+ *
+ * Hard-coded on purpose: the plugin cannot read the host's source at runtime.
+ * It is resolved through pnpm's junction in a different node_modules tree, so
+ * `require('@deepseek-ai/dsh-agent-instructions/lib/index.js')` fails with
+ * MODULE_NOT_FOUND (measured). Two runtime checks make a hard-coded list safe:
+ * the section count must equal `changes.length`, and each section's path must
+ * equal the matching `changes[i].path`. Either check failing means the hook
+ * passes the original message through untouched — so a host that renames these
+ * headers loses the optimisation, it never gets a wrong diff.
+ */
+const SECTION_HEAD = /^(Additional instructions from|Updated instructions from|Instructions removed|Instructions from): (.+)$/
+
+/**
+ * Split an instruction injection into its per-file sections.
+ *
+ * A single message can carry several files: `changes[]` is an array and the body
+ * is the sections joined together. Keying one baseline on the whole body mixes
+ * them up — measured on a real session, 20 of 493 injections carried two files
+ * (`~/.dsh/AGENTS.md` + `AGENTS.md`) under one key.
+ *
+ * Returns `{ sections }` on success, or `{ reason }` when the body cannot be
+ * split with confidence. The caller fails open on `reason`.
+ *
+ * Each section: `{ path, action, text }` where `text` is the file's own content
+ * with the host's framing removed, line endings normalised, and the tail marker
+ * trimmed. `action` comes from `changes[i]`, not from the header wording.
+ *
+ * @param {string} rawText the message text
+ * @param {Array<{path?: string, action?: string}>} changes `source.changes`
+ * @returns {{sections: Array<{path: string, action: string, text: string}>}|{reason: string}}
+ */
+function splitSections(rawText, changes) {
+  if (!Array.isArray(changes) || changes.length === 0) return { reason: 'no changes' }
+
+  /* Normalise first: the header regex uses `$` in multiline mode, and a stray
+   * `\r` would sit between the path and the line end. */
+  const text = normalizeEol(rawText)
+
+  /* Collect every header with its offset. */
+  const heads = []
+  const re = new RegExp(SECTION_HEAD.source, 'gm')
+  let m
+  while ((m = re.exec(text)) !== null) {
+    heads.push({ keyword: m[1], path: m[2].trim(), start: m.index, after: m.index + m[0].length })
+  }
+  if (heads.length === 0) return { reason: 'no section header' }
+  if (heads.length !== changes.length) {
+    return { reason: `section count ${heads.length} != changes ${changes.length}` }
+  }
+
+  /* Paths must line up with `changes` in order — this is what makes a
+   * hard-coded header list safe. */
+  for (let i = 0; i < heads.length; i++) {
+    if (heads[i].path !== String(changes[i]?.path ?? '')) {
+      return { reason: `path mismatch at ${i}: ${heads[i].path} != ${changes[i]?.path}` }
+    }
+  }
+
+  const sections = []
+  for (let i = 0; i < heads.length; i++) {
+    const head = heads[i]
+    const end = i + 1 < heads.length ? heads[i + 1].start : text.length
+    let body = text.slice(head.after, end)
+
+    /* Header-specific preamble the host adds after the title. Strip it so every
+     * section's `text` is the file content alone:
+     *   "set"      → blank, applicability sentence, blank
+     *   "replace"  → blank, "This file changed after it was loaded. …", blank
+     *   baseline   → blank                                        (nothing extra)
+     *   "remove"   → blank, "The previously loaded instructions …" (no content) */
+    if (head.keyword === 'Additional instructions from') {
+      body = body.replace(/^\n+/, '')
+      /* Drop the guidance paragraph: first paragraph after the title. */
+      const paras = body.split('\n\n')
+      paras.shift()
+      body = paras.join('\n\n')
+    } else if (head.keyword === 'Updated instructions from') {
+      body = body.replace(/^\n+/, '')
+      body = body.replace(/^This file changed after it was loaded\.[^\n]*\n+/, '')
+    } else {
+      body = body.replace(/^\n+/, '')
+    }
+
+    body = body.replace(/<\/system-reminder>\s*$/, '').trim()
+
+    sections.push({
+      path: String(changes[i].path),
+      action: String(changes[i].action ?? 'replace'),
+      text: body,
+    })
+  }
+
+  return { sections }
 }
 
 /**
@@ -370,9 +502,18 @@ export function apply(ctx) {
   /**
    * Per-file state.
    *
-   * Keyed by the instruction file's path, so a file that two sessions both
-   * use shares one baseline. The entry count is therefore bounded by the
-   * number of instruction files — it does not grow with sessions.
+   * Keyed by **one file path**. A single injection message can carry several
+   * files (`changes[]` is an array), and each one gets its own entry, so their
+   * baselines never mix.
+   *
+   * This was wrong before: the key was `changes[0].path` and the baseline was
+   * the whole joined body, so a message carrying `~/.dsh/AGENTS.md` + `AGENTS.md`
+   * stored both under the first path. The next message carrying only one of them
+   * compared a single file against the joined pair and reported the other file
+   * as deleted. Measured on a real session: 20 of 493 injections were affected.
+   *
+   * A file that two sessions both use still shares one baseline. The entry count
+   * is therefore bounded by the number of instruction files, not by sessions.
    *
    * @type {Map<string, {baseline: string|null, injected: Set<string>, rewritten: number}>}
    */
@@ -387,11 +528,17 @@ export function apply(ctx) {
     return s
   }
 
-  /** State key: the file path itself. The file count is fixed, so `states` is bounded. */
-  const keyOf = (msg) => {
-    const p = msg?.source?.changes?.[0]?.path
-    return typeof p === 'string' && p.length > 0 ? p : '(unknown)'
-  }
+  /**
+   * Message ids already rewritten, so one message is never rewritten twice.
+   *
+   * This is separate from the per-path baselines above: a message can carry
+   * several files, so "seen this message" is not the same as "seen this file".
+   * Kept in memory only — a restart just re-establishes baselines from the
+   * next full-text injection, which is the safe direction.
+   *
+   * @type {Set<string>}
+   */
+  const injectedMessages = new Set()
 
   /** Best-effort working directory; fullPathOf falls back to process.cwd(). */
   const cwdOf = () => {
@@ -410,7 +557,7 @@ export function apply(ctx) {
         s.baseline = null
         s.injected.clear()
       }
-      if (debugOn()) ctx.logger?.info?.(`[context-diff] COMPACTION reset ${n} baseline(s) (${String(session?.id ?? '').slice(0, 8)})`)
+      if (debugOn()) console.log(`[context-diff] COMPACTION reset ${n} baseline(s) (${String(session?.id ?? '').slice(0, 8)})`)
     } catch (e) {
       shout(ctx, `compaction listener failed: ${e?.message ?? e}`)
     }
@@ -429,72 +576,162 @@ export function apply(ctx) {
       if (idx < 0) return next()
 
       const msg = messages[idx]
-      const st = stateOf(keyOf(msg))
 
-      // Each message is rewritten at most once
+      // Each message is rewritten at most once. Track that on a marker keyed by
+      // the message id alone, because the per-file states below are keyed by path.
       const msgId = String(msg?.id ?? '')
-      if (msgId !== '' && st.injected.has(msgId)) return next()
+      if (msgId !== '' && injectedMessages.has(msgId)) return next()
 
       const text = textOf(msg)
-      const body = bodyOf(text)
-      if (body === null) {
-        if (debugOn()) ctx.logger?.info?.(`[context-diff] SKIP unrecognized shape (len=${text.length})`)
+      const changes = msg?.source?.changes
+      const split = splitSections(text, changes)
+      if (split.reason !== undefined) {
+        if (debugOn()) console.log(`[context-diff] SKIP cannot split: ${split.reason} (len=${text.length})`)
         return next()
       }
 
-      // First time: full text, and this becomes the baseline
-      if (st.baseline === null) {
-        st.baseline = body
-        if (msgId !== '') st.injected.add(msgId)
-        if (debugOn()) ctx.logger?.info?.(`[context-diff] BASELINE ${body.length} chars (${keyOf(msg)})`)
+      /* ── Decide, per file, what this turn looks like ──
+       *
+       * Every section is handled on its own baseline. A file can be:
+       *   first    — no baseline yet, or the baseline was cleared by a compaction
+       *   same     — byte-identical after EOL normalisation
+       *   changed  — a real diff exists
+       *   removed  — `action: "remove"`; the file is gone, so there is no body
+       *
+       * The whole message is rewritten only if **every** section is either
+       * `same` or `changed`-and-worth-it. If any file is `first` or `removed`, or
+       * its diff is not worth the bytes, the message goes out untouched — a
+       * partial rewrite would tell the model that a file it has is gone.
+       */
+      const plans = []
+      let mustPassThrough = false
+
+      for (const section of split.sections) {
+        const st = stateOf(section.path)
+
+        if (section.action === 'remove') {
+          /* The file is gone. Drop the baseline; the `Instructions removed:`
+           * header the host already wrote is the whole message for this file. */
+          st.baseline = null
+          plans.push({ path: section.path, kind: 'removed' })
+          mustPassThrough = true
+          continue
+        }
+
+        if (st.baseline === null) {
+          st.baseline = section.text
+          plans.push({ path: section.path, kind: 'first', len: section.text.length })
+          mustPassThrough = true
+          continue
+        }
+
+        if (st.baseline === section.text) {
+          plans.push({ path: section.path, kind: 'same' })
+          continue
+        }
+
+        const diff = diffLines(st.baseline, section.text)
+        const rendered = renderDiff(section.path, diff, section.text.split('\n').length)
+        plans.push({
+          path: section.path,
+          kind: 'changed',
+          st,
+          sectionText: section.text,
+          diff,
+          rendered,
+          renderedBytes: Buffer.byteLength(rendered, 'utf8'),
+          fullBytes: Buffer.byteLength(section.text, 'utf8'),
+        })
+      }
+
+      /* Worth-it guard, per file: if this file's diff is not shorter than the
+       * file's own text there is nothing to gain, so the whole message passes
+       * through. Rewriting only the profitable files would still describe the
+       * others against a baseline the model keeps — but the header would claim
+       * they changed, which is the misleading part we are fixing. */
+      for (const plan of plans) {
+        if (plan.kind !== 'changed') continue
+        if (plan.renderedBytes >= plan.fullBytes) {
+          plan.kind = 'not-worth-it'
+          mustPassThrough = true
+        }
+      }
+
+      const changedPlans = plans.filter((p) => p.kind === 'changed')
+
+      /* Nothing changed at all: leave the message alone. Baselines already match. */
+      if (plans.every((p) => p.kind === 'same')) {
+        if (msgId !== '') injectedMessages.add(msgId)
+        if (debugOn()) console.log('[context-diff] SKIP identical to baseline')
         return next()
       }
 
-      if (st.baseline === body) {
-        if (msgId !== '') st.injected.add(msgId)
-        if (debugOn()) ctx.logger?.info?.('[context-diff] SKIP identical to baseline')
-        return next()
+      /* Baseline bookkeeping, done once and in one place: every file we saw the
+       * current text of advances its baseline, whether or not the message gets
+       * rewritten. `first` and `remove` already updated theirs above. */
+      const commitBaselines = () => {
+        for (const plan of plans) {
+          if (plan.st !== undefined && plan.sectionText !== undefined) {
+            plan.st.baseline = plan.sectionText
+          }
+        }
       }
 
-      const diff = diffLines(st.baseline, body)
-      const newLen = body.split('\n').length
-      const rendered = renderDiff(fullPathOf(msg?.source?.changes?.[0], cwdOf()), diff, newLen)
-
-      // ── Worth-it guard: if the diff is no shorter than the original, pass the original ──
-      //
-      // When a file changes almost everywhere, every hunk still carries CTX lines of
-      // context, so the rendering can come out longer than the full text: a 383-line
-      // file changed into 334 lines gave 101 hunks and 41,865 characters against 12,901.
-      //
-      // Compare in bytes, not characters: one CJK character is three bytes in UTF-8.
-      // Send the original and still advance the baseline, or the next call compares the old one.
-      const textBytes = Buffer.byteLength(text, 'utf8')
-      const renderedBytes = Buffer.byteLength(rendered, 'utf8')
-      if (renderedBytes >= textBytes) {
-        st.baseline = body
-        if (msgId !== '') st.injected.add(msgId)
+      if (mustPassThrough || changedPlans.length === 0) {
+        commitBaselines()
+        if (msgId !== '') injectedMessages.add(msgId)
         if (debugOn()) {
-          ctx.logger?.info?.(
-            `[context-diff] SKIP not worth it: diff ${renderedBytes}B >= full ${textBytes}B `
-            + `(${diff.hunks.length} hunk(s), ${diff.kind})`,
-          )
+          const why = plans
+            .filter((p) => p.kind !== 'same')
+            .map((p) => `${p.path.slice(-26)}:${p.kind}`)
+            .join(' ')
+          console.log(`[context-diff] PASS THROUGH (${why})`)
         }
         return next()
       }
 
-      const saved = textBytes - renderedBytes
+      /* Every section is `same` or a worth-it `changed`: rewrite the message.
+       * The header names every file that changed, and each file gets its own
+       * section with its own line count — the old single header named only
+       * `changes[0].path` and used the joined line count for all of them. */
+      const totalFull = changedPlans.reduce((n, p) => n + p.fullBytes, 0)
+      const totalDiff = changedPlans.reduce((n, p) => n + p.renderedBytes, 0)
 
+      const header = changedPlans.length === 1
+        ? `1 file changed: ${changedPlans[0].path}. Below is the diff against what you already have, not the full file.`
+        : `${changedPlans.length} files changed. Each section below holds one file's diff against what you already have, not the full file.`
+
+      const out = [header, '']
+      for (const plan of changedPlans) {
+        out.push(`## ${plan.path}`)
+        out.push('')
+        /* renderDiff returns its own first line (a per-file header) and its own
+         * trailing legend. Drop both here: the path is already in the `## ` line
+         * above and the legend is printed once at the end. */
+        const lines = plan.rendered.split('\n')
+        const body = lines
+          .slice(1)                                            // drop its header line
+          .filter((l) => !/^`-` removed, `\+` added,/.test(l))  // drop its legend
+          .join('\n')
+          .trim()
+        out.push(body)
+        out.push('')
+      }
+      out.push('`-` removed, `+` added, unprefixed lines are context anchors. Everything else is unchanged.')
+
+      const rendered = out.join('\n')
       const nextMessages = messages.slice()
       nextMessages[idx] = { ...msg, content: [{ type: 'text', text: rendered }] }
 
-      st.baseline = body
-      if (msgId !== '') st.injected.add(msgId)
-      st.rewritten++
+      commitBaselines()
+      for (const plan of changedPlans) plan.st.rewritten++
+      if (msgId !== '') injectedMessages.add(msgId)
 
       if (debugOn()) {
-        ctx.logger?.info?.(
-          `[context-diff] DIFF ${diff.hunks.length} hunk(s) (${diff.kind}) `
-          + `${textBytes} -> ${renderedBytes} bytes, saved ${saved}`,
+        console.log(
+          `[context-diff] DIFF ${changedPlans.length} file(s): `
+          + changedPlans.map((p) => `${p.path.slice(-22)} ${p.diff.hunks.length}h`).join(', ')
+          + ` | file text ${totalFull}B -> diff ${totalDiff}B, message ${Buffer.byteLength(rendered, 'utf8')}B`,
         )
       }
 
@@ -506,8 +743,8 @@ export function apply(ctx) {
     }
   })
 
-  ctx.logger?.info?.(`[context-diff] loaded ${BUILD}`)
+  console.log(`[context-diff] loaded ${BUILD} (debug=${debugOn() ? 'on' : 'off'})`)
 }
 
 // For tests; does not affect plugin loading
-export const __test = { bodyOf, diffLines, myersDiff, renderDiff, fullPathOf, isInstructionMessage }
+export const __test = { bodyOf, diffLines, myersDiff, renderDiff, fullPathOf, isInstructionMessage, normalizeEol, splitSections }
